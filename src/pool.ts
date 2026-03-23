@@ -11,7 +11,7 @@
  */
 
 const INITIAL_CAPACITY = 8192;
-const MAX_CAPACITY = 131072;
+const MAX_CAPACITY = 524288;  // 512K slots
 
 // Index 0 reserved as null sentinel. Zero-filled Int32Array = no link.
 export const NONE = 0;
