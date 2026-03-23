@@ -16,14 +16,9 @@ import {
   removeChild as poolRemoveChild, replaceChild as poolReplaceChild, detach,
 } from './pool.js';
 
-function getCache(pool: NodePool): Map<number, CLNode> {
-  return pool._proxyCache;
-}
-
 function getOrCreateProxy(pool: NodePool, idx: number): CLNode {
   if (idx === NONE) return null as any;
-  const cache = getCache(pool);
-  const existing = cache.get(idx);
+  const existing = pool._proxyCache[idx];
   if (existing) {
     existing._handle = packHandle(pool.generation[idx], idx);
     return existing;
@@ -38,49 +33,47 @@ function getOrCreateProxy(pool: NodePool, idx: number): CLNode {
     case DOCUMENT_FRAGMENT_NODE: node = new CLDocumentFragment(pool, handle); break;
     default: node = new CLNode(pool, handle); break;
   }
-  cache.set(idx, node);
+  pool._proxyCache[idx] = node;
   return node;
 }
 
 export function clearProxyCache(pool: NodePool, idx: number): void {
-  getCache(pool).delete(idx);
+  pool._proxyCache[idx] = null;
 }
 
 // ── CLNode (base) ──────────────────────────────────────────
 
 export class CLNode {
   readonly _pool: NodePool;
-  _handle: number;
+  readonly _idx: number;  // direct pool index — reads use this (zero overhead)
+  _handle: number;        // generational handle — mutations validate this
 
   constructor(pool: NodePool, handle: number) {
     this._pool = pool;
     this._handle = handle;
+    this._idx = handle & 0x00FFFFFF; // extract index from handle
   }
 
-  private _idx(): number {
+  /** Validate handle for mutations (throws if stale). */
+  private _mutIdx(): number {
     const idx = validateHandle(this._pool, this._handle);
     if (idx === NONE) throw new DOMException('Node is no longer in the document', 'InvalidStateError');
     return idx;
   }
 
-  private _idxOrNull(): number {
-    return validateHandle(this._pool, this._handle);
-  }
-
-  get nodeType(): number { return this._pool.nodeType[this._idx()]; }
-  get nodeName(): string { return this._pool.nodeName[this._idx()] || ''; }
+  get nodeType(): number { return this._pool.nodeType[this._idx]; }
+  get nodeName(): string { return this._pool.nodeName[this._idx] || ''; }
 
   get nodeValue(): string | null {
-    const idx = this._idx();
-    return this._pool.nodeValue[idx];
+    return this._pool.nodeValue[this._idx];
   }
   set nodeValue(v: string | null) {
-    const idx = this._idx();
-    this._pool.nodeValue[idx] = v;
+    this._mutIdx();
+    this._pool.nodeValue[this._idx] = v;
   }
 
   get textContent(): string | null {
-    const idx = this._idx();
+    const idx = this._idx;
     const pool = this._pool;
     if (pool.nodeType[idx] === TEXT_NODE || pool.nodeType[idx] === COMMENT_NODE) {
       return pool.nodeValue[idx];
@@ -99,7 +92,8 @@ export class CLNode {
     return result;
   }
   set textContent(v: string | null) {
-    const idx = this._idx();
+    this._mutIdx();
+    const idx = this._idx;
     const pool = this._pool;
     if (pool.nodeType[idx] === TEXT_NODE || pool.nodeType[idx] === COMMENT_NODE) {
       pool.nodeValue[idx] = v;
@@ -119,7 +113,7 @@ export class CLNode {
   }
 
   get parentNode(): CLNode | null {
-    const idx = this._idxOrNull();
+    const idx = this._idx;
     if (idx === NONE) return null;
     const par = this._pool.parent[idx];
     if (par === NONE) return null;
@@ -133,7 +127,7 @@ export class CLNode {
   }
 
   get firstChild(): CLNode | null {
-    const idx = this._idxOrNull();
+    const idx = this._idx;
     if (idx === NONE) return null;
     const child = this._pool.firstChild[idx];
     if (child === NONE) return null;
@@ -141,7 +135,7 @@ export class CLNode {
   }
 
   get lastChild(): CLNode | null {
-    const idx = this._idxOrNull();
+    const idx = this._idx;
     if (idx === NONE) return null;
     const child = this._pool.lastChild[idx];
     if (child === NONE) return null;
@@ -149,7 +143,7 @@ export class CLNode {
   }
 
   get nextSibling(): CLNode | null {
-    const idx = this._idxOrNull();
+    const idx = this._idx;
     if (idx === NONE) return null;
     const sib = this._pool.nextSibling[idx];
     if (sib === NONE) return null;
@@ -157,7 +151,7 @@ export class CLNode {
   }
 
   get previousSibling(): CLNode | null {
-    const idx = this._idxOrNull();
+    const idx = this._idx;
     if (idx === NONE) return null;
     const sib = this._pool.prevSibling[idx];
     if (sib === NONE) return null;
@@ -165,7 +159,7 @@ export class CLNode {
   }
 
   get childNodes(): CLNode[] {
-    const idx = this._idxOrNull();
+    const idx = this._idx;
     if (idx === NONE) return [];
     const result: CLNode[] = [];
     let child = this._pool.firstChild[idx];
@@ -178,7 +172,7 @@ export class CLNode {
 
   get ownerDocument(): CLDocument | null {
     // Walk up to root
-    let idx = this._idxOrNull();
+    let idx = this._idx;
     if (idx === NONE) return null;
     while (this._pool.parent[idx] !== NONE) idx = this._pool.parent[idx];
     if (this._pool.nodeType[idx] === DOCUMENT_NODE) return getOrCreateProxy(this._pool, idx) as CLDocument;
@@ -186,53 +180,53 @@ export class CLNode {
   }
 
   get isConnected(): boolean {
-    let idx = this._idxOrNull();
+    let idx = this._idx;
     if (idx === NONE) return false;
     while (this._pool.parent[idx] !== NONE) idx = this._pool.parent[idx];
     return this._pool.nodeType[idx] === DOCUMENT_NODE;
   }
 
   hasChildNodes(): boolean {
-    const idx = this._idxOrNull();
+    const idx = this._idx;
     return idx !== NONE && this._pool.firstChild[idx] !== NONE;
   }
 
   appendChild(child: CLNode): CLNode {
-    const parentIdx = this._idx();
-    const childIdx = child._idx();
+    const parentIdx = this._mutIdx();
+    const childIdx = child._idx;
     poolAppendChild(this._pool, parentIdx, childIdx);
     return child;
   }
 
   insertBefore(newNode: CLNode, refNode: CLNode | null): CLNode {
-    const parentIdx = this._idx();
-    const newIdx = newNode._idx();
+    const parentIdx = this._mutIdx();
+    const newIdx = newNode._idx;
     if (!refNode) {
       poolAppendChild(this._pool, parentIdx, newIdx);
     } else {
-      const refIdx = refNode._idx();
+      const refIdx = refNode._idx;
       poolInsertBefore(this._pool, parentIdx, newIdx, refIdx);
     }
     return newNode;
   }
 
   removeChild(child: CLNode): CLNode {
-    const parentIdx = this._idx();
-    const childIdx = child._idx();
+    const parentIdx = this._mutIdx();
+    const childIdx = child._idx;
     detach(this._pool, childIdx);
     // Don't free — W3C spec says removed nodes remain valid (just disconnected)
     return child;
   }
 
   replaceChild(newChild: CLNode, oldChild: CLNode): CLNode {
-    const parentIdx = this._idx();
+    const parentIdx = this._mutIdx();
     this.insertBefore(newChild, oldChild);
     this.removeChild(oldChild);
     return oldChild;
   }
 
   cloneNode(deep: boolean = false): CLNode {
-    const idx = this._idx();
+    const idx = this._mutIdx();
     const pool = this._pool;
     const newIdx = alloc(pool);
     pool.nodeType[newIdx] = pool.nodeType[idx];
@@ -248,7 +242,7 @@ export class CLNode {
       while (child !== NONE) {
         const childProxy = getOrCreateProxy(pool, child);
         const cloned = childProxy.cloneNode(true);
-        poolAppendChild(pool, newIdx, (cloned as any)._idx());
+        poolAppendChild(pool, newIdx, (cloned as any)._idx);
         child = pool.nextSibling[child];
       }
     }
@@ -257,8 +251,8 @@ export class CLNode {
 
   contains(other: CLNode | null): boolean {
     if (!other) return false;
-    let idx = other._idxOrNull();
-    const myIdx = this._idxOrNull();
+    let idx = other._idx;
+    const myIdx = this._idx;
     if (idx === NONE || myIdx === NONE) return false;
     while (idx !== NONE) {
       if (idx === myIdx) return true;
@@ -615,7 +609,7 @@ export function createDocument(pool?: NodePool): CLDocument {
 
 function createPoolDefault(): NodePool {
   return {
-    _proxyCache: new Map(),
+    _proxyCache: new Array(8192).fill(null),
     parent: new Int32Array(8192), firstChild: new Int32Array(8192), lastChild: new Int32Array(8192),
     nextSibling: new Int32Array(8192), prevSibling: new Int32Array(8192),
     generation: new Uint8Array(8192), nodeType: new Uint8Array(8192),

@@ -27,8 +27,9 @@ export const DOCUMENT_NODE = 9;
 export const DOCUMENT_FRAGMENT_NODE = 11;
 
 export interface NodePool {
-  // Proxy cache for node identity
-  _proxyCache: Map<number, any>;
+  // Proxy cache: flat array indexed by slot. proxyCache[idx] = proxy or null.
+  // Array read (proxyCache[idx]) is a single indexed access — same speed as a pointer.
+  _proxyCache: (any | null)[];
 
   // Tree structure (Int32Array — indices, not pointers)
   parent: Int32Array;
@@ -60,7 +61,7 @@ export interface NodePool {
 export function createPool(initialCapacity: number = INITIAL_CAPACITY): NodePool {
   const cap = Math.max(initialCapacity, 64);
   return {
-    _proxyCache: new Map(),
+    _proxyCache: new Array(cap).fill(null),
     parent: new Int32Array(cap),
     firstChild: new Int32Array(cap),
     lastChild: new Int32Array(cap),
@@ -132,6 +133,7 @@ export function freeSlot(pool: NodePool, idx: number): void {
   pool.namespaceURI[idx] = null;
   pool.attributes[idx] = null;
   pool.className[idx] = null;
+  pool._proxyCache[idx] = null;
   // Push to free list
   pool.freeList[idx] = pool.freeHead;
   pool.freeHead = idx;
@@ -163,6 +165,7 @@ function grow(pool: NodePool): void {
   pool.namespaceURI = r(pool.namespaceURI);
   pool.attributes = r(pool.attributes);
   pool.className = r(pool.className);
+  pool._proxyCache = r(pool._proxyCache);
   pool.capacity = newCap;
 }
 
