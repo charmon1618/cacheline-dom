@@ -41,17 +41,44 @@ export function clearProxyCache(pool: NodePool, idx: number): void {
   pool._proxyCache[idx] = null;
 }
 
+/** Sync cached proxy pointers for a node and its neighbors after tree mutation. */
+function syncProxyLinks(pool: NodePool, idx: number): void {
+  const proxy = pool._proxyCache[idx] as CLNode | null;
+  if (!proxy) return;
+  const par = pool.parent[idx];
+  proxy._parentProxy = par !== NONE ? (pool._proxyCache[par] || getOrCreateProxy(pool, par)) : null;
+  const ns = pool.nextSibling[idx];
+  proxy._nextSibProxy = ns !== NONE ? (pool._proxyCache[ns] || getOrCreateProxy(pool, ns)) : null;
+  const ps = pool.prevSibling[idx];
+  proxy._prevSibProxy = ps !== NONE ? (pool._proxyCache[ps] || getOrCreateProxy(pool, ps)) : null;
+}
+
+function syncParentChildLinks(pool: NodePool, parentIdx: number): void {
+  const parentProxy = pool._proxyCache[parentIdx] as CLNode | null;
+  if (!parentProxy) return;
+  const fc = pool.firstChild[parentIdx];
+  parentProxy._firstChildProxy = fc !== NONE ? (pool._proxyCache[fc] || getOrCreateProxy(pool, fc)) : null;
+  const lc = pool.lastChild[parentIdx];
+  parentProxy._lastChildProxy = lc !== NONE ? (pool._proxyCache[lc] || getOrCreateProxy(pool, lc)) : null;
+}
+
 // ── CLNode (base) ──────────────────────────────────────────
 
 export class CLNode {
   readonly _pool: NodePool;
-  readonly _idx: number;  // direct pool index — reads use this (zero overhead)
-  _handle: number;        // generational handle — mutations validate this
+  readonly _idx: number;
+  _handle: number;
+  // Cached traversal pointers — updated by tree mutations, read with zero overhead
+  _parentProxy: CLNode | null = null;
+  _firstChildProxy: CLNode | null = null;
+  _lastChildProxy: CLNode | null = null;
+  _nextSibProxy: CLNode | null = null;
+  _prevSibProxy: CLNode | null = null;
 
   constructor(pool: NodePool, handle: number) {
     this._pool = pool;
     this._handle = handle;
-    this._idx = handle & 0x00FFFFFF; // extract index from handle
+    this._idx = handle & 0x00FFFFFF;
   }
 
   /** Validate handle for mutations (throws if stale). */
@@ -93,70 +120,50 @@ export class CLNode {
   }
   set textContent(v: string | null) {
     this._mutIdx();
-    const idx = this._idx;
     const pool = this._pool;
-    if (pool.nodeType[idx] === TEXT_NODE || pool.nodeType[idx] === COMMENT_NODE) {
-      pool.nodeValue[idx] = v;
+    if (pool.nodeType[this._idx] === TEXT_NODE || pool.nodeType[this._idx] === COMMENT_NODE) {
+      pool.nodeValue[this._idx] = v;
       return;
     }
-    // Remove all children, add text node
-    while (pool.firstChild[idx] !== NONE) {
-      poolRemoveChild(pool, idx, pool.firstChild[idx]);
+    // Remove all children via proxy-aware removeChild
+    // Read from pool directly (not cached proxy) to ensure we see current state
+    while (pool.firstChild[this._idx] !== NONE) {
+      const childIdx = pool.firstChild[this._idx];
+      const childProxy = pool._proxyCache[childIdx] || getOrCreateProxy(pool, childIdx);
+      this.removeChild(childProxy);
     }
     if (v) {
-      const textIdx = alloc(pool);
-      pool.nodeType[textIdx] = TEXT_NODE;
-      pool.nodeName[textIdx] = '#text';
-      pool.nodeValue[textIdx] = v;
-      poolAppendChild(pool, idx, textIdx);
+      // Create text node and append via proxy-aware appendChild
+      const doc = this.ownerDocument;
+      if (doc) {
+        this.appendChild(doc.createTextNode(v));
+      } else {
+        // Fallback: direct pool ops + sync
+        const textIdx = alloc(pool);
+        pool.nodeType[textIdx] = TEXT_NODE;
+        pool.nodeName[textIdx] = '#text';
+        pool.nodeValue[textIdx] = v;
+        poolAppendChild(pool, this._idx, textIdx);
+        syncParentChildLinks(pool, this._idx);
+        syncProxyLinks(pool, textIdx);
+      }
     }
   }
 
-  get parentNode(): CLNode | null {
-    const idx = this._idx;
-    if (idx === NONE) return null;
-    const par = this._pool.parent[idx];
-    if (par === NONE) return null;
-    return getOrCreateProxy(this._pool, par);
-  }
+  get parentNode(): CLNode | null { return this._parentProxy; }
 
   get parentElement(): CLElement | null {
-    const par = this.parentNode;
-    if (par && par.nodeType === ELEMENT_NODE) return par as CLElement;
-    return null;
+    const p = this._parentProxy;
+    return (p && p.nodeType === ELEMENT_NODE) ? p as CLElement : null;
   }
 
-  get firstChild(): CLNode | null {
-    const idx = this._idx;
-    if (idx === NONE) return null;
-    const child = this._pool.firstChild[idx];
-    if (child === NONE) return null;
+  get firstChild(): CLNode | null { return this._firstChildProxy; }
+  get lastChild(): CLNode | null { return this._lastChildProxy;
     return getOrCreateProxy(this._pool, child);
   }
 
-  get lastChild(): CLNode | null {
-    const idx = this._idx;
-    if (idx === NONE) return null;
-    const child = this._pool.lastChild[idx];
-    if (child === NONE) return null;
-    return getOrCreateProxy(this._pool, child);
-  }
-
-  get nextSibling(): CLNode | null {
-    const idx = this._idx;
-    if (idx === NONE) return null;
-    const sib = this._pool.nextSibling[idx];
-    if (sib === NONE) return null;
-    return getOrCreateProxy(this._pool, sib);
-  }
-
-  get previousSibling(): CLNode | null {
-    const idx = this._idx;
-    if (idx === NONE) return null;
-    const sib = this._pool.prevSibling[idx];
-    if (sib === NONE) return null;
-    return getOrCreateProxy(this._pool, sib);
-  }
+  get nextSibling(): CLNode | null { return this._nextSibProxy; }
+  get previousSibling(): CLNode | null { return this._prevSibProxy; }
 
   get childNodes(): CLNode[] {
     const idx = this._idx;
@@ -194,27 +201,65 @@ export class CLNode {
   appendChild(child: CLNode): CLNode {
     const parentIdx = this._mutIdx();
     const childIdx = child._idx;
-    poolAppendChild(this._pool, parentIdx, childIdx);
+    const pool = this._pool;
+    // Track old neighbors for sync
+    const oldPrev = pool.prevSibling[childIdx];
+    const oldNext = pool.nextSibling[childIdx];
+    const oldParent = pool.parent[childIdx];
+    const oldLast = pool.lastChild[parentIdx];
+
+    poolAppendChild(pool, parentIdx, childIdx);
+
+    // Sync proxy caches
+    syncProxyLinks(pool, childIdx);
+    if (oldPrev) syncProxyLinks(pool, oldPrev);
+    if (oldNext) syncProxyLinks(pool, oldNext);
+    if (oldLast) syncProxyLinks(pool, oldLast);
+    if (oldParent && oldParent !== parentIdx) syncParentChildLinks(pool, oldParent);
+    syncParentChildLinks(pool, parentIdx);
     return child;
   }
 
   insertBefore(newNode: CLNode, refNode: CLNode | null): CLNode {
     const parentIdx = this._mutIdx();
+    const pool = this._pool;
     const newIdx = newNode._idx;
     if (!refNode) {
-      poolAppendChild(this._pool, parentIdx, newIdx);
-    } else {
-      const refIdx = refNode._idx;
-      poolInsertBefore(this._pool, parentIdx, newIdx, refIdx);
+      return this.appendChild(newNode);
     }
+    const refIdx = refNode._idx;
+    const oldPrev = pool.prevSibling[newIdx];
+    const oldNext = pool.nextSibling[newIdx];
+    const oldParent = pool.parent[newIdx];
+
+    poolInsertBefore(pool, parentIdx, newIdx, refIdx);
+
+    syncProxyLinks(pool, newIdx);
+    syncProxyLinks(pool, refIdx);
+    if (oldPrev) syncProxyLinks(pool, oldPrev);
+    if (oldNext) syncProxyLinks(pool, oldNext);
+    if (oldParent && oldParent !== parentIdx) syncParentChildLinks(pool, oldParent);
+    syncParentChildLinks(pool, parentIdx);
     return newNode;
   }
 
   removeChild(child: CLNode): CLNode {
-    const parentIdx = this._mutIdx();
+    this._mutIdx();
+    const pool = this._pool;
     const childIdx = child._idx;
-    detach(this._pool, childIdx);
-    // Don't free — W3C spec says removed nodes remain valid (just disconnected)
+    const parentIdx = pool.parent[childIdx];
+    const prevSib = pool.prevSibling[childIdx];
+    const nextSib = pool.nextSibling[childIdx];
+
+    detach(pool, childIdx);
+
+    // Sync
+    child._parentProxy = null;
+    child._nextSibProxy = null;
+    child._prevSibProxy = null;
+    if (prevSib) syncProxyLinks(pool, prevSib);
+    if (nextSib) syncProxyLinks(pool, nextSib);
+    if (parentIdx) syncParentChildLinks(pool, parentIdx);
     return child;
   }
 
