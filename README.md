@@ -95,7 +95,7 @@ No runtime dependencies. Pure TypeScript operating on TypedArrays. Works in Node
 
 ## Part of CacheLine
 
-This is part of the [CacheLine](https://github.com/nicholasgasior/cacheline) project — replacing heap pointer soup with flat array backings across every layer of the stack.
+Part of the CacheLine project — replacing heap pointer soup with flat array backings across every layer of the stack.
 
 - **@cacheline/dom** — W3C DOM on array pool (this package)
 - **@cacheline/reconciler** — React-alternative framework, 3-17x faster
