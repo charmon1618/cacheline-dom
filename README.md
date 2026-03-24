@@ -6,11 +6,11 @@ W3C-compatible DOM implementation backed by flat array pool with generational ha
 
 ## Why
 
-Every browser DOM node is a heap-allocated C++ object linked by 5 pointers (parent, firstChild, lastChild, nextSibling, prevSibling). Traversal = pointer chasing = cache misses = slow.
+jsdom allocates a heap object per DOM node, linked by pointers. For SSR, testing, and headless rendering, that's the bottleneck — you're paying for pointer chasing and GC pressure on trees you never display.
 
 `@cacheline/dom` replaces the heap with a flat `Int32Array` pool. Tree links are array indices, not pointers. Allocation is bump + free list. Generational handles detect stale references.
 
-Same W3C API. Array-backed internals.
+Same W3C API. Array-backed internals. **Not a browser replacement** — a fast jsdom alternative for server-side, testing, edge workers, and anywhere you need a DOM without a browser.
 
 ## Usage
 
